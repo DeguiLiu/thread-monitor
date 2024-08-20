@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-// 定义宏以控制调试信息的输出，默认开启
+//  Define macro to control the output of debug information, enabled by default
 #ifndef ENABLE_DEBUG_OUTPUT
 #define ENABLE_DEBUG_OUTPUT 1
 #endif
@@ -34,7 +34,7 @@
 #define NICE_FIELD_INDEX 19
 #define USER_TICKS_FIELD_INDEX 13
 #define KERNEL_TICKS_FIELD_INDEX 14
-#else  // 默认是x86
+#else  // default is x86
 #define PRIORITY_FIELD_INDEX 17
 #define NICE_FIELD_INDEX 18
 #define USER_TICKS_FIELD_INDEX 13
@@ -275,7 +275,9 @@ class CpuUsageMonitor {
   void ComputeCpuUsage() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    std::tm buf;
+    std::
+
+        tm buf;
     localtime_r(&in_time_t, &buf);
 
     std::lock_guard<std::mutex> log_lock(log_mutex_);
@@ -386,16 +388,62 @@ class CpuUsageMonitor {
 
 }  // namespace cpu_monitor
 
+bool FindPidByProcessName(const std::string& process_name, pid_t& pid) {  // NOLINT
+  DirCloser dir(opendir("/proc"));
+  if (!dir.get()) {
+    fprintf(stderr, "Failed to open directory /proc\n");
+    return false;
+  }
+
+  struct dirent* entry;
+  while ((entry = readdir(dir.get())) != nullptr) {
+    // Check if the entry is a directory and its name is numeric
+    if (entry->d_type == DT_DIR) {
+      std::string pid_str = entry->d_name;
+      if (pid_str.find_first_not_of("0123456789") == std::string::npos) {
+        // Read the "cmdline" file to get the process name
+        std::string cmdline_path = "/proc/" + pid_str + "/cmdline";
+        FILE* cmdline_file = fopen(cmdline_path.c_str(), "r");
+        if (cmdline_file) {
+          FileCloser file_closer(cmdline_file);
+
+          std::stringstream cmdline_stream;
+          char buffer[256];
+          while (fgets(buffer, sizeof(buffer), cmdline_file) != nullptr) {
+            cmdline_stream << buffer;
+          }
+
+          std::string cmdLine = cmdline_stream.str();
+          // Check if the process name matches
+          if (cmdLine.find(process_name) != std::string::npos) {
+            pid = std::stoi(pid_str);
+            // just return the first pid found
+            return true;
+          }
+        } else {
+          fprintf(stderr, "Failed to open %s\n", cmdline_path.c_str());
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 bool ParseCommandLineArgs(int argc, char* argv[], int& pid, int& refresh_delay, std::string& log_filename) {
   int opt;
-  while ((opt = getopt(argc, argv, "hn:o:")) != -1) {
+  bool process_name_mode = false;
+  std::string process_name;
+
+  while ((opt = getopt(argc, argv, "hn:o:p:")) != -1) {
     switch (opt) {
       case 'h':
-        fprintf(stdout, "Usage: %s [option] <pid>\n", argv[0]);
+        fprintf(stdout, "Usage: %s [option] <pid_or_process_name>\n", argv[0]);
         fprintf(stdout, "Options:\n");
         fprintf(stdout, " -h Display help\n");
         fprintf(stdout, " -n <delay> Set the display refresh value in sec.\n");
         fprintf(stdout, " -o <filename> Set the output CSV log file name.\n");
+        fprintf(stdout, " -p <process_name> Specify the process name instead of PID.\n");
         return false;
       case 'n':
         refresh_delay = std::stoi(optarg);
@@ -407,21 +455,32 @@ bool ParseCommandLineArgs(int argc, char* argv[], int& pid, int& refresh_delay, 
       case 'o':
         log_filename = optarg;
         break;
+      case 'p':
+        process_name_mode = true;
+        process_name = optarg;
+        break;
       default:
-        fprintf(stderr, "Usage: %s [option] <pid>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [option] <pid_or_process_name>\n", argv[0]);
         return false;
     }
   }
-  if (optind < argc) {
+
+  if (process_name_mode) {
+    if (!FindPidByProcessName(process_name, pid)) {
+      fprintf(stderr, "Failed to find process with name: %s\n", process_name.c_str());
+      return false;
+    }
+  } else if (optind < argc) {
     pid = std::stoi(argv[optind]);
     if (pid <= 0) {
       fprintf(stderr, "PID must be a positive integer.\n");
       return false;
     }
   } else {
-    fprintf(stderr, "Missing PID.\n");
+    fprintf(stderr, "Missing PID or process name.\n");
     return false;
   }
+
   if (log_filename.empty()) {
     log_filename = "process_" + std::to_string(pid) + ".csv";
   }
