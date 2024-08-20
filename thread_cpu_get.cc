@@ -95,7 +95,7 @@ void SignalHandler(int signal) {
 
 class CpuUsageMonitor {
  public:
-  explicit CpuUsageMonitor(int pid, int refresh_delay, const std::string& log_filename)
+  explicit CpuUsageMonitor(int pid, int refresh_delay, const std::string& db_filename)
       : pid_(pid),
         refresh_delay_(refresh_delay),
         previous_total_cpu_time_(0),
@@ -103,17 +103,18 @@ class CpuUsageMonitor {
         delta_total_cpu_time_(0),
         file_count_(1),
         buffer_size_(4096) {
-    FILE* file = fopen(log_filename.c_str(), "w");
-    if (!file) {
-      fprintf(stderr, "Failed to open log file for writing: %s\n", log_filename.c_str());
-      return;
+    if (unqlite_open(&pDb_, db_filename.c_str(), UNQLITE_OPEN_CREATE) != UNQLITE_OK) {
+      throw std::runtime_error("Failed to open UnQLite database.");
     }
-    log_file_ = std::make_unique<FileCloser>(file);
-    buffer_ = std::make_unique<char[]>(buffer_size_);
-    setvbuf(log_file_->get(), buffer_.get(), _IOFBF, buffer_size_);
 
     InitializeThreads();  // Initialize threads
     PrintProcessInfo();   // Print process and threads info
+  }
+
+  ~CpuUsageMonitor() {
+    if (pDb_) {
+      unqlite_close(pDb_);
+    }
   }
 
   void Run() {
@@ -155,6 +156,7 @@ class CpuUsageMonitor {
   int file_count_;
   size_t buffer_size_;
   std::unique_ptr<char[]> buffer_;
+  unqlite* pDb_;  // UnQLite database handle
 
   // Initialize thread information from /proc filesystem
   void InitializeThreads() {
@@ -275,9 +277,7 @@ class CpuUsageMonitor {
   void ComputeCpuUsage() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    std::
-
-        tm buf;
+    std::tm buf;
     localtime_r(&in_time_t, &buf);
 
     std::lock_guard<std::mutex> log_lock(log_mutex_);
@@ -298,10 +298,13 @@ class CpuUsageMonitor {
         kernel_percent = static_cast<double>(kernel_delta) / delta_total_cpu_time_ * 100.0;
       }
 
-      fprintf(log_file_->get(), "%02d:%02d:%02d,%s,%s,%d,%d\n", buf.tm_hour, buf.tm_min, buf.tm_sec,
-              thread_names_.at(thread).c_str(), thread.c_str(), static_cast<int>(user_percent),
-              static_cast<int>(kernel_percent));
-      fflush(log_file_->get());  // Ensure immediate writing to the log file
+      std::string time_str =
+          std::to_string(buf.tm_hour) + ":" + std::to_string(buf.tm_min) + ":" + std::to_string(buf.tm_sec);
+      std::string key = "cpu_usage_" + std::to_string(pid_) + "_" + thread + "_" + time_str;
+      std::string value = "Time: " + time_str + " | Thread Name: " + thread_names_.at(thread) +
+                          " | Thread ID: " + thread + " | User %: " + std::to_string(user_percent) +
+                          " | Kernel %: " + std::to_string(kernel_percent);
+      unqlite_kv_store(pDb_, key.c_str(), -1, value.c_str(), value.size());
     }
   }
 
@@ -312,57 +315,54 @@ class CpuUsageMonitor {
     previous_total_cpu_time_ = current_total_cpu_time_;
   }
 
-  // Print process and thread information at the start of the log
   void PrintProcessInfo() {
     int process_priority = getpriority(PRIO_PROCESS, pid_);
     if (process_priority == -1 && errno != 0) {
       fprintf(stderr, "Failed to get process priority: %s\n", strerror(errno));
     } else {
-      fprintf(stdout, "Process ID: %d\n", pid_);
-      fprintf(stdout, "Process Priority: %d\n", process_priority);
-      fprintf(log_file_->get(), "Process ID: %d\n", pid_);
-      fprintf(log_file_->get(), "Process Priority: %d\n", process_priority);
-    }
+      // Store process info in the database
+      std::string key = "process_" + std::to_string(pid_) + "_info";
+      std::string value =
+          "Process ID: " + std::to_string(pid_) + " | Process Priority: " + std::to_string(process_priority);
+      unqlite_kv_store(pDb_, key.c_str(), -1, value.c_str(), value.size());
 
-    for (const auto& thread : threads_) {
-      std::string stat_filename = "/proc/" + std::to_string(pid_) + "/task/" + thread + "/stat";
-      std::ifstream stat_file(stat_filename);
-      if (!stat_file.is_open()) {
-        fprintf(stderr, "Failed to open file: %s\n", stat_filename.c_str());
-        continue;
-      }
-
-      std::string line;
-      if (!std::getline(stat_file, line)) {
-        fprintf(stderr, "Failed to read line from file: %s\n", stat_filename.c_str());
-        continue;
-      }
-
-      std::istringstream iss(line);
-      std::string temp;
-      int priority = 0, nice_value = 0;
-
-      // Skip to the appropriate fields based on architecture
-      for (int i = 0; i < PRIORITY_FIELD_INDEX; ++i) {
-        if (!(iss >> temp)) {
-          fprintf(stderr, "Error parsing stat file: %s\n", stat_filename.c_str());
+      for (const auto& thread : threads_) {
+        std::string stat_filename = "/proc/" + std::to_string(pid_) + "/task/" + thread + "/stat";
+        std::ifstream stat_file(stat_filename);
+        if (!stat_file.is_open()) {
+          fprintf(stderr, "Failed to open file: %s\n", stat_filename.c_str());
           continue;
         }
-      }
 
-      // Get the priority and nice value
-      if (!(iss >> priority >> nice_value)) {
-        fprintf(stderr, "Error parsing priority/nice value from stat file: %s\n", stat_filename.c_str());
-        continue;
-      }
+        std::string line;
+        if (!std::getline(stat_file, line)) {
+          fprintf(stderr, "Failed to read line from file: %s\n", stat_filename.c_str());
+          continue;
+        }
 
-      DEBUG_PRINT("Thread ID: %s, Name: %s, Priority: %d, Nice: %d\n", thread.c_str(), thread_names_.at(thread).c_str(),
-                  priority, nice_value);
-      fprintf(log_file_->get(), "Thread ID: %s, Name: %s, Priority: %d, Nice: %d\n", thread.c_str(),
-              thread_names_.at(thread).c_str(), priority, nice_value);
+        std::istringstream iss(line);
+        std::string temp;
+        int priority = 0, nice_value = 0;
+
+        for (int i = 0; i < PRIORITY_FIELD_INDEX; ++i) {
+          if (!(iss >> temp)) {
+            fprintf(stderr, "Error parsing stat file: %s\n", stat_filename.c_str());
+            continue;
+          }
+        }
+
+        if (!(iss >> priority >> nice_value)) {
+          fprintf(stderr, "Error parsing priority/nice value from stat file: %s\n", stat_filename.c_str());
+          continue;
+        }
+
+        std::string thread_key = "thread_" + std::to_string(pid_) + "_" + thread + "_info";
+        std::string thread_value = "Thread ID: " + thread + " | Name: " + thread_names_[thread] +
+                                   " | Priority: " + std::to_string(priority) +
+                                   " | Nice: " + std::to_string(nice_value);
+        unqlite_kv_store(pDb_, thread_key.c_str(), -1, thread_value.c_str(), thread_value.size());
+      }
     }
-    fputs("Time,Thread Name,Thread ID,User %,Kernel %\n", log_file_->get());  // CSV Header
-    fflush(log_file_->get());
   }
 
   // Rotate log file if it exceeds a certain size (e.g., 10 MB)

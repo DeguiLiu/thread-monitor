@@ -1,82 +1,64 @@
+import unqlite
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
-import sys
 import argparse
 
-# 检查文件是否存在且可读
-def check_file_readable(filename):
-    if not os.path.exists(filename):
-        raise FileNotFoundError(f"File {filename} does not exist。")
-    if not os.access(filename, os.R_OK):
-        raise PermissionError(f"File {filename} is not readable。")
+# 打开 UnQLite 数据库并检查是否可访问
+def check_db_accessible(db_path):
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database {db_path} does not exist。")
+    if not os.access(db_path, os.R_OK):
+        raise PermissionError(f"Database {db_path} is not readable。")
 
-# 解析文件头部信息，获取进程和线程信息
-def parse_header_info(filename):
+# 解析数据库头部信息，获取进程和线程信息
+def parse_header_info(db):
     process_info = {}
     thread_info = {}
-    data_start_line = 0
-    line_number = 0
-    with open(filename, 'r') as file:
-        lines = file.readlines()
-        for line in lines:
-            line_number += 1
-            try:
-                if line.startswith("Process ID:"):
-                    process_info['id'] = line.strip().split(": ")[1]
-                elif line.startswith("Process Priority:"):
-                    process_info['priority'] = line.strip().split(": ")[1]
-                elif line.startswith("Thread ID:"):
-                    parts = line.strip().split(',')
-                    thread_id = parts[0].split(': ')[1]
-                    thread_name = parts[1].split(': ')[1]
-                    thread_priority = parts[2].split(': ')[1]
-                    thread_info[thread_name] = {
-                        'id': thread_id,
-                        'priority': thread_priority
-                    }
-                elif line.startswith("Time,Thread Name,Thread ID,User %,Kernel %"):
-                    data_start_line = line_number + 1
-                    break
-            except Exception as e:
-                print(f"Error parsing line {line_number}: {line.strip()}")
-                print(f"Error details: {e}")
-    return process_info, thread_info, data_start_line
 
-# 逐行读取数据，捕获并打印错误行号，并聚合相同线程名称的CPU使用量
-def read_data(filename, start_line):
-    check_file_readable(filename)
+    for key, value in db.cursor():
+        key_str = key.decode()
+        if key_str.startswith("process_"):
+            pid = key_str.split("_")[1]
+            process_info['id'] = pid
+            process_info['priority'] = value.decode().split(": ")[1]
+        elif key_str.startswith("thread_"):
+            parts = key_str.split("_")
+            thread_id = parts[2]
+            thread_name = parts[3]
+            thread_info[thread_name] = {
+                'id': thread_id,
+                'priority': value.decode().split(": ")[1]
+            }
+
+    return process_info, thread_info
+
+# 从 UnQLite 数据库逐行读取数据，并聚合相同线程名称的 CPU 使用量
+def read_data_from_unqlite(db):
     data = []
-    line_number = 0
-    temp_data = {}  # 用于聚合相同线程名称的CPU使用量
+    temp_data = {}  # 用于聚合相同线程名称的 CPU 使用量
 
-    with open(filename, 'r') as file:
-        for line in file:
-            line_number += 1
-            if line_number >= start_line:  # 从数据开始行读取数据
-                try:
-                    timestamp, thread_name, thread_id, user_usage, kernel_usage = line.strip().split(',')
-                    user_usage = float(user_usage)
-                    kernel_usage = float(kernel_usage)
+    for key, value in db.cursor():
+        key_str = key.decode()
+        if key_str.startswith("cpu_usage_"):
+            timestamp, thread_name, thread_id, user_usage, kernel_usage = value.decode().split(',')
+            user_usage = float(user_usage)
+            kernel_usage = float(kernel_usage)
 
-                    # 如果 User 和 Kernel CPU 使用率都为 0，则不保存此行数据
-                    if user_usage == 0 and kernel_usage == 0:
-                        continue
+            # 如果 User 和 Kernel CPU 使用率都为 0，则不保存此行数据
+            if user_usage == 0 and kernel_usage == 0:
+                continue
 
-                    if thread_name not in temp_data:
-                        temp_data[thread_name] = {
-                            'timestamp': [timestamp],
-                            'user_usage': [user_usage],
-                            'kernel_usage': [kernel_usage]
-                        }
-                    else:
-                        temp_data[thread_name]['timestamp'].append(timestamp)
-                        temp_data[thread_name]['user_usage'].append(user_usage)
-                        temp_data[thread_name]['kernel_usage'].append(kernel_usage)
-
-                except ValueError as e:
-                    print(f"Error parsing line {line_number}: {line.strip()}")
-                    print(f"Error details: {e}")
+            if thread_name not in temp_data:
+                temp_data[thread_name] = {
+                    'timestamp': [timestamp],
+                    'user_usage': [user_usage],
+                    'kernel_usage': [kernel_usage]
+                }
+            else:
+                temp_data[thread_name]['timestamp'].append(timestamp)
+                temp_data[thread_name]['user_usage'].append(user_usage)
+                temp_data[thread_name]['kernel_usage'].append(kernel_usage)
 
     # 将聚合后的数据转换为 DataFrame
     frames = []
@@ -103,7 +85,7 @@ def calculate_statistics(subset):
     }
     return stats
 
-# 计算并返回进程的总CPU使用情况
+# 计算并返回进程的总 CPU 使用情况
 def calculate_process_cpu(data):
     process_cpu = data.groupby('timestamp').agg({
         'user_usage': 'sum',
@@ -133,17 +115,17 @@ def get_summary_table(process_info, thread_info, data):
 
     return "\n".join(summary_lines)
 
-# 绘制每个线程的用户时间和内核时间占用百分比，并绘制整个进程的总CPU使用情况
+# 绘制每个线程的用户时间和内核时间占用百分比，并绘制整个进程的总 CPU 使用情况
 def plot_cpu_usage(process_info, thread_info, data, filter_thread=None, filter_cpu_type=None, time_range=None, show_summary_info=True):
     plt.figure(figsize=(14, 10))  # 增加图表高度以留出更多空间放置文本
 
-    # 计算进程总CPU使用情况
+    # 计算进程总 CPU 使用情况
     process_cpu = calculate_process_cpu(data)
 
-    # 绘制进程总CPU使用情况曲线
+    # 绘制进程总 CPU 使用情况曲线
     plt.plot(process_cpu['timestamp'], process_cpu['total_usage'], label='Process Total CPU Usage', color='black', linewidth=2)
 
-    # 过滤线程或CPU类型
+    # 过滤线程或 CPU 类型
     if filter_thread:
         data = data[data['thread_name'].str.contains(filter_thread, case=False)]
     if filter_cpu_type:
@@ -170,7 +152,7 @@ def plot_cpu_usage(process_info, thread_info, data, filter_thread=None, filter_c
         # 处理异常数据，例如填充缺失值
         subset = subset.fillna(0)
 
-        # 绘制线程的CPU使用曲线
+        # 绘制线程的 CPU 使用曲线
         plt.plot(subset['timestamp'], subset['user_usage'], label=f'{thread_name} (User)', linestyle='--')
         plt.plot(subset['timestamp'], subset['kernel_usage'], label=f'{thread_name} (Kernel)', linestyle=':')
 
@@ -178,7 +160,7 @@ def plot_cpu_usage(process_info, thread_info, data, filter_thread=None, filter_c
     plt.ylabel('CPU Usage (%)')
     plt.title('CPU Usage Over Time by Thread')
 
-    # 调整X轴标签的密度，显示一部分的标签
+    # 调整 X 轴标签的密度，显示一部分的标签
     x_ticks = plt.gca().get_xticks()
     plt.xticks(x_ticks[::max(1, len(x_ticks)//10)], rotation=45)  # 只显示部分标签
 
@@ -186,7 +168,7 @@ def plot_cpu_usage(process_info, thread_info, data, filter_thread=None, filter_c
     plt.grid(True)
     plt.tight_layout(rect=[0, 0.1, 1, 0.95])  # 调整布局，给底部留出空间放置文本
 
-    # 在图的X轴下方显示简洁的进程和线程信息（如果配置为显示）
+    # 在图的 X 轴下方显示简洁的进程和线程信息（如果配置为显示）
     if show_summary_info:
         plt.figtext(0.02, 0.01, summary_info, fontsize=9, verticalalignment='bottom', horizontalalignment='left', bbox=dict(facecolor='white', alpha=0.5))
 
@@ -198,8 +180,8 @@ def plot_cpu_usage(process_info, thread_info, data, filter_thread=None, filter_c
 
 def main():
     # 创建命令行参数解析器
-    parser = argparse.ArgumentParser(description="Analyze and plot CPU usage data from a CSV file.")
-    parser.add_argument('filename', type=str, help="The path to the CSV file.")
+    parser = argparse.ArgumentParser(description="Analyze and plot CPU usage data from a UnQLite database.")
+    parser.add_argument('db_path', type=str, help="The path to the UnQLite database.")
     parser.add_argument('--filter-thread', type=str, help="Filter by thread name (case insensitive).")
     parser.add_argument('--filter-cpu-type', type=str, choices=['user', 'kernel'], help="Filter by CPU usage type ('user' or 'kernel').")
     parser.add_argument('--time-range', type=str, help="Filter by time range, format: 'start_time,end_time' (e.g., '12:00:00,12:30:00').")
@@ -208,10 +190,17 @@ def main():
     args = parser.parse_args()
 
     try:
+        # 检查数据库文件是否存在且可访问
+        check_db_accessible(args.db_path)
+
+        # 打开数据库
+        db = unqlite.UnQLite(args.db_path)
+
         # 解析头部信息
-        process_info, thread_info, start_line = parse_header_info(args.filename)
+        process_info, thread_info = parse_header_info(db)
+
         # 读取数据
-        data = read_data(args.filename, start_line)
+        data = read_data_from_unqlite(db)
 
         # 打印基本信息和统计数据
         if not args.hide_summary:
