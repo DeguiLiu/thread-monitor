@@ -257,8 +257,8 @@ class CpuUsageMonitor {
         delta_total_cpu_time_(0),
         db_(db_filename),
         thread_id_mapper_(db_) {
-    // db_.clear();          // Clear the database
     InitializeThreads();  // Initialize threads
+    ReadAndStoreProcessName();  // 读取并存储进程名称
     PrintProcessInfo();   // Print process and threads info
   }
 
@@ -284,6 +284,28 @@ class CpuUsageMonitor {
     fprintf(stdout, "Exiting gracefully...\n");
   }
 
+  void StoreProcessName() {
+    std::string key = "process_name";
+    db_.store(key, process_name_.c_str(), process_name_.size());
+  }
+
+  void ReadAndStoreProcessName() {
+    std::string comm_filename = "/proc/" + std::to_string(pid_) + "/comm";
+    std::ifstream comm_file(comm_filename);
+    if (comm_file.is_open()) {
+      std::getline(comm_file, process_name_);
+      if (!process_name_.empty()) {
+        std::string key = "process_name";
+        db_.store(key, process_name_.c_str(), process_name_.size());
+        DEBUG_PRINT("Stored process name: %s\n", process_name_.c_str());
+      } else {
+        fprintf(stderr, "Process name is empty for PID %d.\n", pid_);
+      }
+    } else {
+      fprintf(stderr, "Failed to open %s\n", comm_filename.c_str());
+    }
+  }
+
  private:
   int pid_;
   int refresh_delay_;
@@ -298,6 +320,8 @@ class CpuUsageMonitor {
   ThreadIdMapper thread_id_mapper_;  // Use the ThreadIdMapper instance
   std::mutex data_mutex_;
   std::map<std::string, int> thread_priorities_;  // Used to store the priority of each thread
+  std::map<int, std::string> compressed_thread_names_;
+  std::string process_name_;
 
 // Define a compact structure to store CPU usage data for each thread.
 // This structure is designed to minimize memory usage by using bit fields and tightly packed data.
@@ -342,6 +366,7 @@ class CpuUsageMonitor {
     threads_.clear();
     thread_names_.clear();
     thread_priorities_.clear();
+    compressed_thread_names_.clear();  // Clear compressed thread names
 
     std::string task_path = "/proc/" + std::to_string(pid_) + "/task";
     DIR* dir = opendir(task_path.c_str());
@@ -362,6 +387,11 @@ class CpuUsageMonitor {
           std::string thread_name;
           std::getline(comm_file, thread_name);
           thread_names_[tid_str] = thread_name;
+
+          // Get the compressed thread ID
+          int real_thread_id = std::stoi(tid_str);
+          int compressed_thread_id = thread_id_mapper_.GetOrAssignCompressedThreadId(real_thread_id);
+          compressed_thread_names_[compressed_thread_id] = thread_name;
 
           // Get priority and nice values ​​from /proc/[pid]/task/[tid]/stat file
           std::string stat_filename = task_path + "/" + tid_str + "/stat";
@@ -401,7 +431,21 @@ class CpuUsageMonitor {
         }
       }
     }
+    // Store the compressed thread names into the database
+    StoreCompressedThreadNames();
   }
+
+  void StoreCompressedThreadNames() {
+    std::string key = "thread_name_map";
+    std::stringstream ss;
+    for (const auto& entry : compressed_thread_names_) {
+      ss << entry.first << ":" << entry.second << ";";
+    }
+    std::string value = ss.str();
+    db_.store(key, value.c_str(), value.size());
+    DEBUG_PRINT("Stored thread name mapping: %s\n", value.c_str());
+  }
+
 
   void GetThreadCpuTicks() {
     std::lock_guard<std::mutex> lck(data_mutex_);

@@ -49,8 +49,32 @@ def load_thread_id_mapping(db):
         for item in value.split(";"):
             if item:
                 real_id, compressed_id = item.split(":")
-                thread_id_map[int(compressed_id)] = int(real_id)
+                thread_id_map[int(real_id)] = int(compressed_id)
     return thread_id_map
+
+
+def load_thread_name_mapping(db):
+    key = "thread_name_map"
+    value = db.fetch(key)
+
+    thread_name_map = {}
+    if value:
+        value = value.decode("utf-8")
+        for item in value.split(";"):
+            if item:
+                compressed_id, name = item.split(":", 1)
+                thread_name_map[int(compressed_id)] = name
+    return thread_name_map
+
+
+def load_process_name(db):
+    key = "process_name"
+    value = db.fetch(key)
+
+    if value:
+        return value.decode("utf-8")
+    else:
+        return "Unknown Process"
 
 
 COMPACT_CPU_USAGE_SIZE = 10  # 每个结构体的字节大小为10字节
@@ -88,9 +112,9 @@ def parse_compact_cpu_usage_data(raw_data):
         user_ticks = (full_data >> 14) & 0xFFFF  # 提取 user_ticks 的 16 bits（用户模式下的CPU时间片数）
         kernel_ticks = (full_data >> 30) & 0xFFFF  # 提取 kernel_ticks 的 16 bits（内核模式下的CPU时间片数）
         timestamp = (full_data >> 46) & 0xFFFFF  # 提取 timestamp 的 20 bits（时间戳，表示自某个时刻的秒数）
-        thread_id = (full_data >> 68) & 0x7F  # 提取 thread_id 的 7 bits（压缩后的线程ID）
-        thread_status = (full_data >> 75) & 0x03  # 提取 thread_status 的 2 bits（线程状态，例如运行、睡眠等）
-        extra_flags = (full_data >> 77) & 0x07  # 提取 extra_flags 的 3 bits（额外的标志位或线程元数据）
+        thread_id = (full_data >> 66) & 0x7F  # 调整位移，原代码可能有误
+        thread_status = (full_data >> 73) & 0x03  # 调整位移
+        extra_flags = (full_data >> 75) & 0x07  # 调整位移
 
         # 将解析后的各字段值存入字典，并添加到结果列表中
         records.append(
@@ -112,12 +136,13 @@ def parse_compact_cpu_usage_data(raw_data):
 def read_db_data(db_filename):
     db = UnqliteDB(db_filename)
     thread_id_map = load_thread_id_mapping(db)
+    thread_name_map = load_thread_name_mapping(db)
+    process_name = load_process_name(db)  # 读取进程名称
     keys = db.db.keys()
     keys = sorted(db.db.keys())
     temp_data = {}
 
     for key in keys:
-        # 确保 key 是字符串，如果是字节对象，则解码为字符串
         if isinstance(key, bytes):
             key_str = key.decode("utf-8")
         else:
@@ -125,12 +150,14 @@ def read_db_data(db_filename):
 
         if key_str.startswith("batch_"):
             raw_data = db.db[key]
-
             parsed_records = parse_compact_cpu_usage_data(raw_data)
 
             for record in parsed_records:
-                real_thread_id = thread_id_map.get(record["thread_id"], "unknown")
-                thread_key = f"tid_{real_thread_id}"
+                compressed_thread_id = record["thread_id"]
+                real_thread_id = thread_id_map.get(compressed_thread_id, "unknown")
+                thread_name = thread_name_map.get(compressed_thread_id, f"tid_{real_thread_id}")
+
+                thread_key = thread_name  # 使用线程名称而不是通用ID
 
                 if thread_key not in temp_data:
                     temp_data[thread_key] = {
@@ -142,13 +169,11 @@ def read_db_data(db_filename):
                 else:
                     temp_data[thread_key]["timestamp"].append(record["timestamp"])
                     temp_data[thread_key]["user_usage"].append(record["user_percent"])
-                    temp_data[thread_key]["kernel_usage"].append(
-                        record["kernel_percent"]
-                    )
+                    temp_data[thread_key]["kernel_usage"].append(record["kernel_percent"])
 
     db.close()
 
-    # Convert to DataFrame
+    # 转换为 DataFrame
     frames = []
     for thread_name, usage in temp_data.items():
         df = pd.DataFrame(
@@ -161,7 +186,12 @@ def read_db_data(db_filename):
         )
         frames.append(df)
 
-    return pd.concat(frames, ignore_index=True)
+    if frames:
+        data = pd.concat(frames, ignore_index=True)
+    else:
+        data = pd.DataFrame()
+
+    return data, process_name  # 返回数据和进程名称
 
 
 # 计算每个线程的统计数据（最小值、最大值、平均值）
@@ -199,8 +229,9 @@ def calculate_process_cpu(data):
 
 
 # 打印进程和线程的基本信息和统计数据
-def get_summary_table(thread_info, data):
+def get_summary_table(thread_info, data, process_name="Unknown Process"):
     summary_lines = []
+    summary_lines.append(f"Process Name: {process_name}")
 
     for thread_name in data["thread_name"].unique():
         subset = data[data["thread_name"] == thread_name]
@@ -234,6 +265,7 @@ def get_summary_table(thread_info, data):
 def plot_cpu_usage(
     thread_info,
     data,
+    process_name="Unknown Process",  # 添加进程名称参数
     filter_thread=None,
     filter_cpu_type=None,
     time_range=None,
@@ -244,10 +276,10 @@ def plot_cpu_usage(
     # 计算进程总CPU使用情况
     process_cpu = calculate_process_cpu(data)
 
-    # 将时间戳转换为小时:分钟:秒格式
-    process_cpu["timestamp"] = pd.to_datetime(process_cpu["timestamp"]).dt.strftime(
-        "%H:%M:%S"
-    )
+    # 将时间戳转换为可读的时间格式
+    process_cpu["timestamp"] = pd.to_datetime(process_cpu["timestamp"], unit="s")
+    process_cpu = process_cpu.sort_values("timestamp")
+
     # 绘制进程总CPU使用情况曲线
     plt.plot(
         process_cpu["timestamp"],
@@ -270,19 +302,15 @@ def plot_cpu_usage(
         start_time, end_time = time_range
         data = data[(data["timestamp"] >= start_time) & (data["timestamp"] <= end_time)]
 
-    data["timestamp"] = pd.to_datetime(data["timestamp"]).dt.strftime("%H:%M:%S")
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
 
     # 绘制每个线程的CPU使用情况曲线
     for thread_name in data["thread_name"].unique():
         subset = data[data["thread_name"] == thread_name]
+        subset = subset.sort_values("timestamp")
 
-        user_sum = subset.get("user_usage", 0)
-        kernel_sum = subset.get("kernel_usage", 0)
-
-        if isinstance(user_sum, int):
-            user_sum = pd.Series(user_sum, index=subset.index)
-        if isinstance(kernel_sum, int):
-            kernel_sum = pd.Series(kernel_sum, index=subset.index)
+        user_sum = subset.get("user_usage", pd.Series([0]))
+        kernel_sum = subset.get("kernel_usage", pd.Series([0]))
 
         if user_sum.sum() + kernel_sum.sum() == 0:
             continue
@@ -307,20 +335,16 @@ def plot_cpu_usage(
                 linestyle=":",
             )
 
-    plt.xlabel("Time (HH:MM:SS)")
+    plt.xlabel("Time")
     plt.ylabel("CPU Usage (%)")
-    plt.title("CPU Usage Over Time by Thread")
-
-    # 调整x轴标签的密度
-    x_ticks = plt.gca().get_xticks()
-    plt.xticks(x_ticks[:: max(1, len(x_ticks) // 10)], rotation=45)
-
+    plt.title(f"CPU Usage Over Time by Thread for Process: {process_name}")  # 在标题中显示进程名称
+    plt.gcf().autofmt_xdate()  # 自动格式化日期标签
     plt.legend(loc="upper left", bbox_to_anchor=(1, 1))
     plt.grid(True)
     plt.tight_layout(rect=[0, 0.1, 1, 0.95])
 
     if show_summary_info:
-        summary_info = get_summary_table(thread_info, data)
+        summary_info = get_summary_table(thread_info, data, process_name)
 
         plt.figtext(
             0.02,
@@ -366,12 +390,16 @@ def main():
     args = parser.parse_args()
 
     try:
-        # 读取数据
-        data = read_db_data(args.filename)
+        # 读取数据和进程名称
+        data, process_name = read_db_data(args.filename)
+
+        if data.empty:
+            print("No data found in the database.")
+            return
 
         # 打印基本信息和统计数据
         if not args.hide_summary:
-            print(get_summary_table({}, data))
+            print(get_summary_table({}, data, process_name))
 
         time_range = None
         if args.time_range:
@@ -381,6 +409,7 @@ def main():
         plot_cpu_usage(
             {},
             data,
+            process_name=process_name,  # 传递进程名称
             filter_thread=args.filter_thread,
             filter_cpu_type=args.filter_cpu_type,
             time_range=time_range,
@@ -388,7 +417,7 @@ def main():
         )
 
     except Exception as e:
-        print("An error occurred: %s", e)
+        print(f"An error occurred: {e}")
 
 
 if __name__ == "__main__":
