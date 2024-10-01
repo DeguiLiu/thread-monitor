@@ -1,74 +1,80 @@
 ## 概述
 
-本工具是一个结合 C++ 和 Python 的 CPU 使用率监控与分析工具。通过读取 Linux 系统的 `/proc` 文件系统，实时采集 CPU 使用数据，使用 UnQLite 数据库进行高效存储，并通过 Python 进行数据解析和可视化展示。该工具支持对多个进程的 CPU 使用情况进行同时监控和分析。
+本工具是一个结合 C++ 和 Python 的 CPU 使用率监控与分析工具。通过读取 Linux 系统的 `/proc` 文件系统，实时采集 CPU 使用数据。C++程序负责采集CPU数据并记录到二进制文件中，Python脚本则解析这些数据并生成直观的可视化图表
 
-## 编译与运行
+## 功能特性
 
-### 使用 UnQLite 数据库存储方案
+- **实时监控**：实时采集指定进程及其线程的用户态和内核态CPU使用率。
+- **多线程支持**：自动识别并监控进程中的所有线程，获取每个线程的CPU使用数据。
+- **数据记录**：将采集到的CPU使用数据以高效的二进制格式存储，便于后续分析。
+- **可视化分析**：通过Python脚本解析数据并生成详细的CPU使用率图表，支持过滤特定线程和时间范围。
+- **优雅退出**：支持通过`Ctrl+C`中断程序，确保数据完整性和资源的正确释放。
 
-1. **启动模拟进程 (`dummp_worker`)**
+## 安装与使用
 
-   `dummp_worker` 是一个用于模拟的待分析进程：
+### C++录制程序
+
+#### 编译
+
+确保系统已安装`g++`编译器，然后在项目根目录下运行：
+
+```bash
+g++ -std=c++11 -o cpu_monitor cpu_monitor.cc -pthread
+```
+
+#### 运行
+
+```bash
+./cpu_monitor [选项] <PID或进程名称>
+```
+
+**选项**：
+
+- `-h`：显示帮助信息。
+- `-n <延迟>`：设置CPU使用数据刷新间隔（秒，支持小数，如0.1）。
+- `-o <输出文件>`：设置输出二进制文件名（默认`cpu_usage.bin`）。
+
+### Python解析脚本
+
+#### 安装依赖
+
+确保已安装Python 3及以下库：
+
+```bash
+pip install pandas matplotlib
+```
+
+#### 运行
+
+```bash
+python3 cpu_usage_parser cpu_usage.bin [选项]
+```
+
+**选项**：
+
+- `--filter-thread <线程名>`：按线程名称过滤数据。
+- `--filter-cpu-type {user,kernel}`：按CPU使用类型过滤数据。
+- `--time-range "开始时间,结束时间"`：指定时间范围（格式如`2024-09-24 12:00:00,2024-09-24 12:30:00`）。
+- `--hide-summary`：隐藏图表底部的摘要信息。
+
+## 示例
+
+1. 监控进程ID为`12345`，刷新间隔为`0.5`秒，输出文件为`cpu_data.bin`：
+
    ```bash
-   sudo ./dummp_worker 2 0.4
-   ```
-   该命令将启动两个线程，每个线程占用 40% 的 CPU。
-
-2. **编译并运行 C++ 程序**
-
-   使用以下命令编译 C++ 程序：
-   ```bash
-   g++ -o thread_cpu_unqlite thread_cpu_unqlite.cc -lunqlite -O2
-   ```
-
-   运行 C++ 程序进行数据采集：
-   ```bash
-   ./thread_cpu_unqlite -n1 dummp_worker -d dummp_worker.db
-   ```
-   该命令将每秒采集一次 `dummp_worker` 进程的 CPU 使用数据，并将结果存储在 `dummp_worker.db` 中。
-
-3. **使用 Python 进行数据解析和可视化**
-
-   安装所需的 Python 库：
-   ```bash
-   pip3 install unqlite pandas matplotlib
-   ```
-
-   运行 Python 脚本解析和可视化数据：
-   ```bash
-   python3 thread_cpu_unqlite4.py dummp_worker.db
-   ```
-
-### 使用 CSV 文件存储方案
-
-1. **启动模拟进程 (`dummp_worker`)**
-
-   与 UnQLite 方案相同，启动模拟进程：
-   ```bash
-   sudo ./dummp_worker 2 0.4
-   ```
-
-2. **编译并运行 C++ 程序**
-
-   使用以下命令编译 C++ 程序：
-   ```bash
-   g++ -o thread_cpu_get thread_cpu_get.cc -O2
-   ```
-
-   运行 C++ 程序进行数据采集，并将结果保存为 CSV 文件：
-   ```bash
-   ./thread_cpu_get -n1 dummp_worker
-   ```
-
-3. **使用 Python 解析 CSV 文件**
-
-   安装所需的 Python 库：
-   ```bash
-   pip3 install unqlite pandas matplotlib
+   ./cpu_monitor -n 0.5 -o cpu_data.bin 12345
    ```
 
-   运行 Python 脚本解析 CSV 文件并进行数据分析：
+2. 解析并绘制数据，过滤线程名包含`worker`的线程：
+
    ```bash
-   python3 thread_cpu_parse.py process_dummp_worker.csv
+   python3 cpu_usage_parser cpu_data.bin --filter-thread worker
    ```
 
+## 贡献
+
+欢迎任何形式的贡献！请提交Issue或Pull Request，以帮助我们改进项目。
+
+## 许可证
+
+本项目采用MIT许可证。详情请参阅[LICENSE](LICENSE)。
