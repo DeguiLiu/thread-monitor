@@ -71,9 +71,6 @@ python3 cpu_usage_parser cpu_usage.bin [选项]
    python3 cpu_usage_parser cpu_data.bin --filter-thread worker
    ```
 
-## 贡献
-
-欢迎任何形式的贡献！请提交Issue或Pull Request，以帮助我们改进项目。
 
 ## 许可证
 
