@@ -4,36 +4,37 @@ import os
 import struct
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as font_manager
 import argparse
 from datetime import datetime
 import sys
 
-# Define the size of each CpuUsageData record in bytes
-CPU_USAGE_SIZE = 16
+# Update the size of each CpuUsageData record (in bytes)
+CPU_USAGE_SIZE = 22  # Updated to 22 bytes
 
 def parse_cpu_usage_data(record_bytes):
     """
     Parse a single CpuUsageData record from bytes.
 
     Parameters:
-    record_bytes (bytes): 16-byte binary data representing CPU usage.
+    record_bytes (bytes): 22-byte binary data representing CPU usage.
 
     Returns:
     dict: Parsed fields from the record.
     """
     if len(record_bytes) != CPU_USAGE_SIZE:
-        raise ValueError("Record size must be 16 bytes")
+        raise ValueError("Record size must be 22 bytes")
 
     # Define the struct format: little-endian
-    # B: uint8_t user_percent
-    # B: uint8_t kernel_percent
-    # H: uint16_t user_ticks
-    # H: uint16_t kernel_ticks
+    # H: uint16_t user_percent
+    # H: uint16_t kernel_percent
+    # I: uint32_t user_ticks
+    # I: uint32_t kernel_ticks
     # I: uint32_t timestamp
     # I: uint32_t thread_id
     # B: uint8_t thread_status
     # B: uint8_t extra_flags
-    struct_format = '<BBHHIIBB'
+    struct_format = '<HHIIIIBB'
     unpacked_data = struct.unpack(struct_format, record_bytes)
 
     record = {
@@ -100,11 +101,6 @@ def read_file_header(f):
 
         thread_name_map[thread_id] = thread_name
 
-    # Debug: Print the header information
-    # Uncomment the following lines for debugging purposes
-    # print(f"Process Name: {process_name}")
-    # print(f"Thread Name Map: {thread_name_map}")
-
     return process_name, thread_name_map
 
 def read_cpu_usage_bin(filename):
@@ -147,23 +143,30 @@ def parse_records_to_dataframe(records, thread_name_map):
 
     Parameters:
     records (list of dict): Parsed CPU usage records.
-    thread_name_map (dict): Mapping from thread ID to thread name.
+    thread_name_map (dict): Mapping from thread_id to thread_name.
 
     Returns:
     pandas.DataFrame: DataFrame containing the CPU usage data.
     """
     data = pd.DataFrame(records)
+    if data.empty:
+        return data  # Return empty DataFrame if no records
     # Ensure thread_id is integer
     data["thread_id"] = data["thread_id"].astype(int)
     # Map thread_id to thread_name
     data["thread_name"] = data["thread_id"].map(thread_name_map).fillna("unknown")
     # Convert timestamp to datetime (assuming timestamp is seconds since epoch)
     data["timestamp"] = pd.to_datetime(data["timestamp"], unit="s")
+
+    # Adjust percentage values: Convert user_percent and kernel_percent from 0-10000 to 0-100%
+    data["user_percent"] = data["user_percent"] / 100.0
+    data["kernel_percent"] = data["kernel_percent"] / 100.0
+
     return data
 
 def calculate_statistics(subset):
     """
-    Calculate statistics (min, max, mean) for user and kernel CPU usage.
+    Calculate statistics (min, max, mean) for total CPU usage.
 
     Parameters:
     subset (pandas.DataFrame): Subset of data for a specific thread.
@@ -173,15 +176,10 @@ def calculate_statistics(subset):
     """
     stats = {}
 
-    if "user_percent" in subset.columns:
-        stats["min_user"] = subset["user_percent"].min()
-        stats["max_user"] = subset["user_percent"].max()
-        stats["mean_user"] = subset["user_percent"].mean()
-
-    if "kernel_percent" in subset.columns:
-        stats["min_kernel"] = subset["kernel_percent"].min()
-        stats["max_kernel"] = subset["kernel_percent"].max()
-        stats["mean_kernel"] = subset["kernel_percent"].mean()
+    if "total_usage" in subset.columns:
+        stats["min_total"] = subset["total_usage"].min()
+        stats["max_total"] = subset["total_usage"].max()
+        stats["mean_total"] = subset["total_usage"].mean()
 
     return stats
 
@@ -222,36 +220,68 @@ def get_summary_table(data, process_name="Unknown Process"):
     Returns:
     str: Summary table as a string.
     """
-    summary_lines = []
-    summary_lines.append(f"Process Name: {process_name}")
+    if data.empty:
+        return f"Process Name: {process_name}\nNo data available."
 
-    for thread_name in data["thread_name"].unique():
-        subset = data[data["thread_name"] == thread_name]
+    # Ensure 'total_usage' is calculated
+    if "total_usage" not in data.columns:
+        data["total_usage"] = data["user_percent"] + data["kernel_percent"]
 
-        user_exists = "user_percent" in subset.columns
-        kernel_exists = "kernel_percent" in subset.columns
+    # Calculate average and max CPU usage per thread and sort
+    thread_stats = data.groupby("thread_name")["total_usage"].agg(['mean', 'max']).reset_index()
+    # Sort by average CPU usage in descending order
+    thread_stats = thread_stats.sort_values(by='mean', ascending=False)
 
-        if (
-            user_exists
-            and subset["user_percent"].sum() == 0
-            and kernel_exists
-            and subset["kernel_percent"].sum() == 0
-        ):
-            continue
+    # Prepare summary table header
+    header = f"{'thread_name':30s} | {'Max CPU%':>8s} | {'Avg CPU%':>8s}"
+    separator = "-" * len(header)
+    summary_lines = [f"Process Name: {process_name}", separator, header, separator]
 
-        stats = calculate_statistics(subset)
+    # Format statistics for each thread
+    for _, row in thread_stats.iterrows():
+        thread_name = row['thread_name']
+        max_cpu = f"{row['max']:.2f}"
+        avg_cpu = f"{row['mean']:.2f}"
+        line = f"{thread_name:30s} | {max_cpu:>8s} | {avg_cpu:>8s}"
+        summary_lines.append(line)
 
-        user_stats = ""
-        kernel_stats = ""
-        if user_exists:
-            user_stats = f"Max/Avg User={stats['max_user']}%/{stats['mean_user']:.2f}%"
-        if kernel_exists:
-            kernel_stats = (
-                f"Max/Avg Kernel={stats['max_kernel']}%/{stats['mean_kernel']:.2f}%"
-            )
+    # Add separator at the end
+    summary_lines.append(separator)
 
-        summary_lines.append(f"{thread_name}: {user_stats} | {kernel_stats}")
     return "\n".join(summary_lines)
+
+def split_summary_table(summary_lines):
+    """
+    Split the summary table into two columns with headers.
+
+    Parameters:
+    summary_lines (list): List of lines in the summary table.
+
+    Returns:
+    tuple: (left_column (str), right_column (str))
+    """
+    # Find the indices of the header lines
+    separator_indices = [i for i, line in enumerate(summary_lines) if set(line) == {"-"}]
+    if len(separator_indices) < 2:
+        # Not enough separators, return as is
+        return ("\n".join(summary_lines), "")
+
+    # Extract the header and separator
+    header = summary_lines[separator_indices[0]+1]
+    separator_line = summary_lines[separator_indices[0]]
+
+    # Split the data lines
+    data_lines = summary_lines[separator_indices[1]+1:-1]  # Exclude last separator
+    half = (len(data_lines) + 1) // 2  # Ensure the first half is at least as big as the second
+
+    # Build left and right columns
+    left_lines = [separator_line, header, separator_line] + data_lines[:half] + [separator_line]
+    right_lines = [separator_line, header, separator_line] + data_lines[half:] + [separator_line]
+
+    left_column = "\n".join(left_lines)
+    right_column = "\n".join(right_lines)
+
+    return (left_column, right_column)
 
 def plot_cpu_usage(
     data,
@@ -260,6 +290,9 @@ def plot_cpu_usage(
     filter_cpu_type=None,
     time_range=None,
     show_summary_info=True,
+    top_n=10,
+    separate_cpu=False,
+    output_filename="cpu_usage_over_time.png",
 ):
     """
     Plot CPU usage over time for the process and its threads.
@@ -267,12 +300,22 @@ def plot_cpu_usage(
     Parameters:
     data (pandas.DataFrame): DataFrame containing CPU usage data.
     process_name (str): Name of the process.
-    filter_thread (str, optional): Filter to include only specific thread names.
+    filter_thread (str, optional): Filter to include only specific thread_names.
     filter_cpu_type (str, optional): Filter to include only 'user' or 'kernel' CPU usage.
     time_range (tuple, optional): Tuple of (start_time, end_time) to filter the data.
-    show_summary_info (bool): Whether to display summary information on the plot.
+    show_summary_info (bool): Whether to display summary information at the bottom of the plot.
+    top_n (int): Number of top threads to display based on average CPU usage.
+    separate_cpu (bool): Whether to plot user and kernel CPU usages separately.
+    output_filename (str): Filename to save the plot.
     """
+    if data.empty:
+        print("No data to plot.")
+        return
+
     plt.figure(figsize=(14, 10))
+
+    # Ensure 'total_usage' is calculated
+    data["total_usage"] = data["user_percent"] + data["kernel_percent"]
 
     # Calculate total CPU usage of the process
     process_cpu = calculate_process_cpu(data)
@@ -280,7 +323,7 @@ def plot_cpu_usage(
     # Sort by timestamp
     process_cpu = process_cpu.sort_values("timestamp")
 
-    # Plot total CPU usage
+    # Plot total CPU usage of the process
     plt.plot(
         process_cpu["timestamp"],
         process_cpu["total_usage"],
@@ -292,81 +335,123 @@ def plot_cpu_usage(
     # Apply filters if any
     if filter_thread:
         data = data[data["thread_name"].str.contains(filter_thread, case=False)]
-    if filter_cpu_type:
-        if filter_cpu_type.lower() == "user":
-            data = data[["timestamp", "thread_name", "user_percent"]]
-        elif filter_cpu_type.lower() == "kernel":
-            data = data[["timestamp", "thread_name", "kernel_percent"]]
 
     if time_range:
         start_time, end_time = time_range
         data = data[(data["timestamp"] >= start_time) & (data["timestamp"] <= end_time)]
 
-    # Sort data by timestamp
-    data = data.sort_values("timestamp")
+    # Calculate average CPU usage per thread and select top N threads
+    avg_cpu_usage = data.groupby("thread_name")["total_usage"].mean()
+    top_threads = avg_cpu_usage.nlargest(top_n).index.tolist()
+    data = data[data["thread_name"].isin(top_threads)]
+
+    # Sort threads by average CPU usage
+    sorted_threads = avg_cpu_usage.loc[top_threads].sort_values(ascending=False).index.tolist()
+
+    # Sort data by timestamp and thread CPU usage
+    data = data.reset_index()
+    data['thread_name'] = pd.Categorical(data['thread_name'], categories=sorted_threads, ordered=True)
+    data = data.sort_values(["thread_name", "timestamp"])
 
     # Set timestamp as index for resampling
     data.set_index("timestamp", inplace=True)
 
-    # Determine resampling frequency based on data
-    # Assuming the refresh_delay is consistent; if not, consider a fixed frequency like 'S' for seconds
+    # Resampling frequency
     resample_freq = 'S'  # 1 second
 
-    # Plot CPU usage for each thread
-    for thread_name in data["thread_name"].unique():
+    # Plot CPU usage for each thread, in order of CPU usage
+    lines = []
+    labels = []
+
+    for thread_name in sorted_threads:
         subset = data[data["thread_name"] == thread_name]
 
+        if subset.empty:
+            continue
+
         # Resample to ensure continuity
-        if filter_cpu_type:
-            usage_column = "user_percent" if filter_cpu_type.lower() == "user" else "kernel_percent"
-            usage = subset[usage_column].resample(resample_freq).mean().interpolate()
-            plt.plot(
-                usage.index,
-                usage.values,
-                label=f"{thread_name} ({filter_cpu_type.capitalize()})",
-                linestyle="-",
-            )
-        else:
-            # Plot both user and kernel CPU usage
+        if separate_cpu:
+            # Plot user and kernel CPU usage separately
             user_usage = subset["user_percent"].resample(resample_freq).mean().interpolate()
             kernel_usage = subset["kernel_percent"].resample(resample_freq).mean().interpolate()
 
-            plt.plot(
+            line_user, = plt.plot(
                 user_usage.index,
                 user_usage.values,
                 label=f"{thread_name} (User)",
                 linestyle="-",
             )
-            plt.plot(
+            line_kernel, = plt.plot(
                 kernel_usage.index,
                 kernel_usage.values,
                 label=f"{thread_name} (Kernel)",
-                linestyle=":",
+                linestyle="--",
             )
+            lines.extend([line_user, line_kernel])
+            labels.extend([f"{thread_name} (User)", f"{thread_name} (Kernel)"])
+        else:
+            # Plot combined CPU usage
+            total_usage = subset["total_usage"].resample(resample_freq).mean().interpolate()
+            line, = plt.plot(
+                total_usage.index,
+                total_usage.values,
+                label=f"{thread_name}",
+                linestyle="-",
+            )
+            lines.append(line)
+            labels.append(f"{thread_name}")
 
     plt.xlabel("Time")
     plt.ylabel("CPU Usage (%)")
     plt.title(f"CPU Usage Over Time by Thread for Process: {process_name}")
     plt.gcf().autofmt_xdate()
-    plt.legend(loc="upper left", bbox_to_anchor=(1, 1))
+
+    # Create legend with sorted entries
+    plt.legend(lines, labels, loc="upper left", bbox_to_anchor=(1, 1))
+
     plt.grid(True)
-    plt.tight_layout(rect=[0, 0.1, 1, 0.95])
+
+    # Adjust layout based on whether summary info is shown
+    if show_summary_info:
+        plt.tight_layout(rect=[0, 0.20, 1, 0.95])
+    else:
+        plt.tight_layout(rect=[0, 0.02, 1, 0.95])
 
     if show_summary_info:
         summary_info = get_summary_table(data.reset_index(), process_name)
 
+        # Split summary information into two columns with headers
+        summary_lines = summary_info.split('\n')
+        left_column, right_column = split_summary_table(summary_lines)
+
+        # Use monospace font for alignment
+        monospace_font = font_manager.FontProperties(family='monospace', size=9)
+
+        # Display two columns of summary information at the bottom of the plot
         plt.figtext(
             0.02,
             0.01,
-            summary_info,
+            left_column,
             fontsize=9,
+            fontproperties=monospace_font,
             verticalalignment="bottom",
             horizontalalignment="left",
             bbox=dict(facecolor="white", alpha=0.5),
         )
+        if right_column.strip():
+            plt.figtext(
+                0.32,  # Adjust the position of the right column
+                0.01,
+                right_column,
+                fontsize=9,
+                fontproperties=monospace_font,
+                verticalalignment="bottom",
+                horizontalalignment="left",
+                bbox=dict(facecolor="white", alpha=0.5),
+            )
 
     try:
-        plt.savefig("cpu_usage_over_time.png")
+        plt.savefig(output_filename)
         plt.show()
     except KeyboardInterrupt:
         print("\nPlotting interrupted by user. Exiting gracefully.")
@@ -383,7 +468,7 @@ def main():
     parser.add_argument(
         "filename", type=str, help="The path to the cpu_usage.bin file."
     )
-    parser.add_argument("--filter-thread", type=str, help="Filter by thread name.")
+    parser.add_argument("--filter-thread", type=str, help="Filter by thread_name.")
     parser.add_argument(
         "--filter-cpu-type",
         type=str,
@@ -400,8 +485,36 @@ def main():
         action="store_true",
         help="Hide the process and thread summary information at the bottom of the plot.",
     )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="Number of top threads to display based on average CPU usage.",
+    )
+    parser.add_argument(
+        "--separate-cpu",
+        action="store_true",
+        help="Plot user and kernel CPU usages separately.",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default="cpu_usage_over_time.png",
+        help="Filename to save the output plot.",
+    )
 
     args = parser.parse_args()
+
+    # Add the following print statements to display parameters
+    print("Parsed command-line arguments:")
+    print(f"Input filename       : {args.filename}")
+    print(f"Filter thread        : {args.filter_thread}")
+    print(f"Filter CPU type      : {args.filter_cpu_type}")
+    print(f"Time range           : {args.time_range}")
+    print(f"Hide summary         : {args.hide_summary}")
+    print(f"Top N threads        : {args.top}")
+    print(f"Separate CPU         : {args.separate_cpu}")
+    print(f"Output file          : {args.output_file}")
 
     try:
         # Read and parse the binary file
@@ -412,6 +525,12 @@ def main():
 
         # Convert records to DataFrame
         data = parse_records_to_dataframe(records, thread_name_map)
+        if data.empty:
+            print("No data available to process.")
+            return
+
+        # Ensure 'total_usage' is calculated
+        data["total_usage"] = data["user_percent"] + data["kernel_percent"]
 
         # Print summary information
         if not args.hide_summary:
@@ -437,6 +556,9 @@ def main():
             filter_cpu_type=args.filter_cpu_type,
             time_range=time_range,
             show_summary_info=not args.hide_summary,
+            top_n=args.top,
+            separate_cpu=args.separate_cpu,
+            output_filename=args.output_file,
         )
 
     except KeyboardInterrupt:
