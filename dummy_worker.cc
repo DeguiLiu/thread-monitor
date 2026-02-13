@@ -4,31 +4,36 @@
 // dummy_worker.cc - Configurable CPU load generator for testing cpu_monitor.
 //
 // Creates N worker threads, each occupying a target percentage of one CPU core
-// via busy-wait + sleep cycles. Supports graceful shutdown via SIGINT/SIGTERM.
+// via busy-wait + condvar-wait cycles. Supports instant graceful shutdown via
+// SIGINT/SIGTERM using condition_variable notification (no sleep tail delay).
 
 #include <pthread.h>
 #include <sched.h>
-#include <sys/prctl.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Signal handling
+// Shutdown coordination: atomic flag + condvar for instant wakeup
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_running{true};
+static std::mutex g_mutex;
+static std::condition_variable g_cv;
 
 static void SignalHandler(int sig) {
   if (sig == SIGINT || sig == SIGTERM) {
     g_running.store(false, std::memory_order_relaxed);
+    // Wake all sleeping workers immediately
+    g_cv.notify_all();
   }
 }
 
@@ -42,6 +47,16 @@ static void BusyWait(int64_t ns) {
     // Lightweight syscall to prevent aggressive optimization
     getpid();
   }
+}
+
+// Interruptible sleep using condition_variable.
+// Returns immediately if g_running becomes false.
+static void InterruptibleSleep(int64_t ns) {
+  if (ns <= 0) return;
+  std::unique_lock<std::mutex> lock(g_mutex);
+  g_cv.wait_for(lock, std::chrono::nanoseconds(ns), [] {
+    return !g_running.load(std::memory_order_relaxed);
+  });
 }
 
 static void WorkerThread(int id, float rate) {
@@ -75,9 +90,7 @@ static void WorkerThread(int id, float rate) {
 
   while (g_running.load(std::memory_order_relaxed)) {
     BusyWait(busy_ns);
-    if (sleep_ns > 0) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
-    }
+    InterruptibleSleep(sleep_ns);
   }
 }
 
