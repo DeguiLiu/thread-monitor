@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [cpu_bin, main, master]
+  pull_request:
+    branches: [cpu_bin, main, master]
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+
+    runs-on: ${{ matrix.os }}
+    name: Build & Test (${{ matrix.arch }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Release, -Werror)
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -j$(nproc)
+
+      - name: Unit tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Build (Debug, ASan + UBSan)
+        run: |
+          rm -rf build-san && mkdir build-san && cd build-san
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+          cmake --build . -j$(nproc)
+
+      - name: Unit tests (ASan + UBSan)
+        run: cd build-san && ctest --output-on-failure
+
+      - name: E2E smoke test
+        run: |
+          cd build
+          ./dummy_worker 2 0.5 &
+          WORKER_PID=$!
+          sleep 2
+          ./cpu_monitor -p $WORKER_PID -d 0.5 -n 3 -o /tmp/e2e_test.bin
+          kill $WORKER_PID 2>/dev/null || true
+          wait $WORKER_PID 2>/dev/null || true
+          python3 ../cpu_usage_parser.py /tmp/e2e_test.bin --no-plot
+          python3 ../cpu_usage_parser.py /tmp/e2e_test.bin --csv /tmp/e2e_test.csv --no-plot
+          echo "E2E test passed on $(uname -m)"
+
+      - name: Binary size
+        run: |
+          echo "=== Binary sizes on $(uname -m) ==="
+          ls -lh build/cpu_monitor build/dummy_worker
