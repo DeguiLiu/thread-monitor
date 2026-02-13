@@ -20,15 +20,48 @@ cpu_usage.bin ──> cpu_usage_parser.py ──> 统计摘要 / CSV / 图表
 - 进程退出自动停止监控
 - 动态线程发现（运行期间新建的线程自动纳入）
 - 实时终端显示模式（类 top）
+- steady_clock 固定周期采样，避免漂移
 - 二进制格式 v2，带 magic number 和版本号
 - Python 解析器：统计摘要（avg/max/p50/p95/p99）、CSV 导出、matplotlib 图表
 - 向后兼容 v1 格式
+
+## 设计要点
+
+- 解析层与 I/O 分离：`proc::io` 负责文件读取，`proc::parse` 负责纯解析（可用合成数据单测）
+- 所有 API 返回 `ErrorCode` 枚举，不使用异常
+- 热路径零堆分配：预分配 vector，复用 path buffer，flat vector 替代 std::map
+- 固定宽度整数类型（uint64_t 防溢出）
+- Google C++ Style，-Werror 编译
+- 支持 ASan/UBSan 构建
+
+## 性能
+
+自身开销测试（x86_64, 64 核, 0.5s 采样间隔, 监控 9 线程进程）：
+
+| 指标 | 值 |
+|------|-----|
+| cpu_monitor CPU 占用 | < 0.01% |
+| 内存占用 | ~1.2 MB RSS |
+| 采样精度 | 误差 < 3%（对比设定值） |
+
+测试数据（8 worker 线程，设定 60% CPU 占用率）：
+
+| 线程 | Avg% | Max% | P50% | P95% |
+|------|------|------|------|------|
+| worker_0~7 | 57.5~58.3 | 59.0~61.0 | 56.9~58.8 | 58.9~59.2 |
 
 ## 编译
 
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build .
+```
+
+可选 Sanitizer：
+
+```bash
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
 cmake --build .
 ```
 
@@ -85,6 +118,14 @@ Python 依赖：matplotlib（仅绘图需要）
 ```bash
 # 启动 4 个 worker 线程，各占 50% CPU
 ./dummy_worker 4 0.5
+
+# Ctrl+C 优雅退出
+```
+
+### 单元测试
+
+```bash
+cd build && ctest --output-on-failure
 ```
 
 ## 二进制格式 v2
@@ -127,13 +168,20 @@ thread_cpu% = delta_thread_ticks / (delta_system_total_ticks / num_cpus) * 100
 ## 文件结构
 
 ```
-├── CMakeLists.txt         # 构建配置
-├── proc_parser.hpp        # /proc 文件系统解析库（header-only）
-├── cpu_monitor.cc         # 监控主程序
-├── dummy_worker.cc        # 测试用负载生成器
+├── CMakeLists.txt         # 构建配置（-Werror, ASan/UBSan 可选）
+├── CPPLINT.cfg            # cpplint 配置
+├── proc_parser.hpp        # /proc 文件系统解析库（header-only, I/O 与解析分离）
+├── cpu_monitor.cc         # 监控主程序（steady_clock 固定周期采样）
+├── dummy_worker.cc        # 测试用负载生成器（支持 SIGINT 优雅退出）
 ├── cpu_usage_parser.py    # Python 解析和可视化
+├── test_proc_parser.cc    # 解析层单元测试
 └── README.md
 ```
+
+## 平台兼容性
+
+- x86_64 Linux: 已验证
+- aarch64 (ARM) Linux: /proc/stat 字段布局一致，理论兼容
 
 ## 许可证
 
